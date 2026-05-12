@@ -1,23 +1,34 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from tkinter.scrolledtext import ScrolledText
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageOps
 import zipfile
 import os
 import re
 import time
+from io import BytesIO
 
-# --- LBIMG5 encoder/decoder (for PNG) --- #
-# We keep this because main image display is needed.
+# --- LBIMG5 encoder/decoder --- #
 
 def encode_lbimg(png_path):
-    # Just store PNG bytes directly
-    with open(png_path, "rb") as f:
-        return f.read()
+    """Encodes PNG at 100% quality and physically rotates pixels if vertical."""
+    with Image.open(png_path) as img:
+        # PHYSICALLY rotate pixels based on phone's orientation flag 
+        # before we strip the metadata.
+        img = ImageOps.exif_transpose(img)
+        img = img.convert("RGBA")
+        
+        output = BytesIO()
+        # Save at 100% quality, optimize=True, and strip EXIF/ICC profiles
+        img.save(output, format="PNG", quality=100, optimize=True, icc_profile=None)
+        return output.getvalue()
 
 def decode_lbimg(data):
-    from io import BytesIO
-    return Image.open(BytesIO(data))
+    """Decodes the image and ensures it stays upright."""
+    img = Image.open(BytesIO(data))
+    # Safety check for decoding
+    img = ImageOps.exif_transpose(img)
+    return img
 
 # --- LBScript interpreter --- #
 
@@ -31,9 +42,9 @@ class LBScriptRunner:
         self.transparency = 255
         self.txtboxinput = ""
         self.filepicked = ""
+        
     def strip_quotes(self, text):
-        if not text:
-            return text
+        if not text: return text
         if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
             return text[1:-1]
         return text
@@ -44,123 +55,86 @@ class LBScriptRunner:
             self.image_window.title(self.lbix_name)
             self.image_window.protocol("WM_DELETE_WINDOW", self.cmd_close)
 
-            self.canvas = tk.Canvas(self.image_window, width=self.main_img.width, height=self.main_img.height)
-            self.canvas.pack()
+        # --- SMART SCALING ---
+        # Get 80% of screen size so the image isn't too huge
+        screen_w = self.master.winfo_screenwidth() * 0.8
+        screen_h = self.master.winfo_screenheight() * 0.8
+        
+        display_img = self.main_img.copy()
+        w, h = display_img.size
+        
+        if w > screen_w or h > screen_h:
+            ratio = min(screen_w / w, screen_h / h)
+            new_size = (int(w * ratio), int(h * ratio))
+            display_img = display_img.resize(new_size, Image.Resampling.LANCZOS)
 
-        img = self.main_img.copy()
         if self.transparency < 255:
-            img.putalpha(self.transparency)
-        self.img_tk = ImageTk.PhotoImage(img)
+            display_img.putalpha(self.transparency)
+        
+        self.img_tk = ImageTk.PhotoImage(display_img)
+        
+        if hasattr(self, 'canvas'):
+            self.canvas.destroy()
+            
+        self.canvas = tk.Canvas(self.image_window, width=display_img.width, height=display_img.height)
+        self.canvas.pack()
         self.canvas.create_image(0, 0, anchor="nw", image=self.img_tk)
 
     def substitute_vars(self, text):
-        text = text.replace("%txtboxinput%", self.txtboxinput)
-        text = text.replace("%lbixname%", self.lbix_name)
-        text = text.replace("%filepicked%", self.filepicked)
+        text = text.replace("%txtboxinput%", str(self.txtboxinput))
+        text = text.replace("%lbixname%", str(self.lbix_name))
+        text = text.replace("%filepicked%", str(self.filepicked))
         return text
 
     def run_script(self, script):
-        # Split lines, support quotes for showmsgbox
         lines = script.strip().splitlines()
         for line in lines:
             line = line.strip()
-            if not line or line.startswith("#"):
-                continue
+            if not line or line.startswith("#"): continue
             try:
                 self.execute_line(line)
             except Exception as e:
-                messagebox.showerror("LBScript Error", f"Error executing line:\n{line}\n\n{e}")
+                messagebox.showerror("LBScript Error", f"Line: {line}\n{e}")
                 break
 
     def execute_line(self, line):
-        # Parse commands:
-        # setwintitle <text>
-        # showmsgbox "title", "text"
-        # wait <milliseconds>
-        # transparency add|sub <value>
-        # showtxtbox <text>
-        # math add|sub <number>
-        # showfilepicker <title>
-        # close
-
-        # Regex to match showmsgbox "title", "text"
         if line.startswith("setwintitle "):
-            arg = line[len("setwintitle "):].strip()
-            arg = self.substitute_vars(arg)
-            arg = self.strip_quotes(arg)
+            arg = self.strip_quotes(self.substitute_vars(line[12:].strip()))
             if self.image_window and self.image_window.winfo_exists():
                 self.image_window.title(arg)
 
         elif line.startswith("showmsgbox"):
-            # Extract "title", "text"
             m = re.match(r'showmsgbox\s+"([^"]+)"\s*,\s*"([^"]+)"', line)
-            if not m:
-                raise ValueError("showmsgbox requires syntax: showmsgbox \"title\", \"text\"")
-            title = self.strip_quotes(self.substitute_vars(m.group(1)))
-            text = self.strip_quotes(self.substitute_vars(m.group(2)))
-            messagebox.showinfo(title, text)
+            if m:
+                title = self.strip_quotes(self.substitute_vars(m.group(1)))
+                text = self.strip_quotes(self.substitute_vars(m.group(2)))
+                messagebox.showinfo(title, text)
 
         elif line.startswith("wait "):
-            arg = line[len("wait "):].strip()
             try:
-                ms = int(arg)
+                ms = int(line[5:].strip())
                 self.master.update()
                 time.sleep(ms / 1000.0)
-            except:
-                raise ValueError("wait requires an integer milliseconds argument")
+            except: pass
 
         elif line.startswith("transparency "):
             parts = line.split()
-            if len(parts) != 3:
-                raise ValueError("transparency requires 2 arguments")
-            op = parts[1].lower()
-            try:
-                val = int(parts[2])
-            except:
-                raise ValueError("transparency second argument must be a number")
-            if op == "add":
-                self.transparency = max(0, min(255, self.transparency + val))
-            elif op == "sub":
-                self.transparency = max(0, min(255, self.transparency - val))
-            else:
-                raise ValueError("transparency operation must be 'add' or 'sub'")
+            op, val = parts[1].lower(), int(parts[2])
+            if op == "add": self.transparency = min(255, self.transparency + val)
+            elif op == "sub": self.transparency = max(0, self.transparency - val)
             self.show_image()
 
         elif line.startswith("showtxtbox "):
-            text = line[len("showtxtbox "):].strip()
-            text = self.strip_quotes(self.substitute_vars(text))
-            self.txtboxinput = simpledialog.askstring("Input", text)
-
-        elif line.startswith("math "):
-            parts = line.split()
-            if len(parts) != 3:
-                raise ValueError("math requires 2 arguments")
-            op = parts[1].lower()
-            try:
-                val = float(parts[2])
-            except:
-                raise ValueError("math second argument must be a number")
-            # We keep math command to modify transparency for example (or other numeric state)
-            if op == "add":
-                self.transparency = max(0, min(255, self.transparency + int(val)))
-            elif op == "sub":
-                self.transparency = max(0, min(255, self.transparency - int(val)))
-            else:
-                raise ValueError("math operation must be 'add' or 'sub'")
-            self.show_image()
+            prompt = self.strip_quotes(self.substitute_vars(line[11:].strip()))
+            self.txtboxinput = simpledialog.askstring("Input", prompt)
 
         elif line.startswith("showfilepicker "):
-            title = line[len("showfilepicker "):].strip()
-            title = self.strip_quotes(self.substitute_vars(title))
+            title = self.strip_quotes(self.substitute_vars(line[15:].strip()))
             fname = filedialog.askopenfilename(title=title)
-            if fname:
-                self.filepicked = fname
+            if fname: self.filepicked = fname
 
         elif line == "close":
             self.cmd_close()
-
-        else:
-            raise ValueError(f"Unknown command: {line}")
 
     def cmd_close(self):
         if self.image_window and self.image_window.winfo_exists():
@@ -171,16 +145,15 @@ class LBScriptRunner:
 
 def save_lbix(path, main_img_path, script_text):
     main_data = encode_lbimg(main_img_path)
-    with zipfile.ZipFile(path, "w") as z:
-        z.writestr("main.lbimg", main_data)
-        z.writestr("script.lbix", script_text)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("image.lbimg", main_data)
+        z.writestr("main.lbscript", script_text)
 
 def load_lbix(path):
     with zipfile.ZipFile(path, "r") as z:
-        main_data = z.read("main.lbimg")
-        script_text = z.read("script.lbix").decode("utf-8")
-    main_img = decode_lbimg(main_data)
-    return main_img, script_text
+        main_data = z.read("image.lbimg")
+        script_text = z.read("main.lbscript").decode("utf-8")
+    return decode_lbimg(main_data), script_text
 
 # --- GUI --- #
 
@@ -188,96 +161,66 @@ class LBIXApp:
     def __init__(self, master):
         self.master = master
         self.master.title("LBIX Builder & Viewer")
-        self.main_img = None
-        self.script_text = ""
-        self.lbix_path = None
-
+        self.master.geometry("700x550")
+        
         self.notebook = ttk.Notebook(master)
-        self.notebook.pack(fill="both", expand=True)
+        self.notebook.pack(fill="both", expand=True, padx=5, pady=5)
 
-        # Builder tab
         self.builder_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.builder_frame, text="Builder")
-
+        
         self.main_img_path_var = tk.StringVar()
-
+        
         row = 0
-        ttk.Label(self.builder_frame, text="Main Image PNG:").grid(row=row, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(self.builder_frame, text="Source PNG:").grid(row=row, column=0, sticky="w", padx=5, pady=5)
         ttk.Entry(self.builder_frame, textvariable=self.main_img_path_var, width=40).grid(row=row, column=1, sticky="ew", padx=5, pady=5)
         ttk.Button(self.builder_frame, text="Browse", command=self.browse_main_img).grid(row=row, column=2, padx=5, pady=5)
         row += 1
 
-        ttk.Label(self.builder_frame, text="LBScript for images:").grid(row=row, column=0, sticky="nw", padx=5, pady=5)
+        ttk.Label(self.builder_frame, text="Script:").grid(row=row, column=0, sticky="nw", padx=5, pady=5)
         self.script_textbox = ScrolledText(self.builder_frame, width=60, height=15)
         self.script_textbox.grid(row=row, column=1, columnspan=2, sticky="nsew", padx=5, pady=5)
         row += 1
 
         self.builder_frame.grid_rowconfigure(row-1, weight=1)
         self.builder_frame.grid_columnconfigure(1, weight=1)
+        ttk.Button(self.builder_frame, text="Save .LBIX", command=self.save_lbix_file).grid(row=row, column=1, sticky="e", padx=5, pady=10)
 
-        ttk.Button(self.builder_frame, text="Save LBIX File", command=self.save_lbix_file).grid(row=row, column=1, sticky="e", padx=5, pady=10)
-
-        # Viewer tab
         self.viewer_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.viewer_frame, text="Viewer")
-
         self.lbix_open_path_var = tk.StringVar()
-
-        ttk.Label(self.viewer_frame, text="Open LBIX File:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(self.viewer_frame, text="Open LBIX:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
         ttk.Entry(self.viewer_frame, textvariable=self.lbix_open_path_var, width=50).grid(row=0, column=1, sticky="ew", padx=5, pady=5)
         ttk.Button(self.viewer_frame, text="Browse", command=self.browse_lbix_file).grid(row=0, column=2, padx=5, pady=5)
-        ttk.Button(self.viewer_frame, text="View image", command=self.run_script_from_lbix).grid(row=1, column=1, sticky="e", padx=5, pady=5)
-
+        ttk.Button(self.viewer_frame, text="Run LBIX", command=self.run_script_from_lbix).grid(row=1, column=1, sticky="e", padx=5, pady=5)
         self.viewer_frame.grid_columnconfigure(1, weight=1)
 
-        self.script_runner = None
-
     def browse_main_img(self):
-        path = filedialog.askopenfilename(title="Select Main Image PNG", filetypes=[("PNG Images", "*.png")])
-        if path:
-            self.main_img_path_var.set(path)
+        path = filedialog.askopenfilename(filetypes=[("PNG", "*.png")])
+        if path: self.main_img_path_var.set(path)
 
     def save_lbix_file(self):
-        main_img_path = self.main_img_path_var.get()
+        img_p = self.main_img_path_var.get()
         script = self.script_textbox.get("1.0", "end").strip()
-        if not main_img_path or not os.path.isfile(main_img_path):
-            messagebox.showerror("Error", "Valid main image PNG must be selected.")
-            return
-        if not script:
-            messagebox.showerror("Error", "Script cannot be empty.")
-            return
-        save_path = filedialog.asksaveasfilename(title="Save LBIX File", defaultextension=".lbix",
-                                                 filetypes=[("LBIX files", "*.lbix")])
-        if save_path:
-            try:
-                save_lbix(save_path, main_img_path, script)
-                messagebox.showinfo("Success", f"LBIX file saved to {save_path}")
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to save LBIX file: {e}")
-
+        if img_p and script:
+            save_path = filedialog.asksaveasfilename(defaultextension=".lbix", filetypes=[("LBIX", "*.lbix")])
+            if save_path:
+                save_lbix(save_path, img_p, script)
+                messagebox.showinfo("Success", "LBIX saved.")
 
     def browse_lbix_file(self):
-        path = filedialog.askopenfilename(title="Open LBIX File", filetypes=[("LBIX files", "*.lbix")])
-        if path:
-            self.lbix_open_path_var.set(path)
+        path = filedialog.askopenfilename(filetypes=[("LBIX", "*.lbix")])
+        if path: self.lbix_open_path_var.set(path)
 
     def run_script_from_lbix(self):
         path = self.lbix_open_path_var.get()
-        if not path or not os.path.isfile(path):
-            messagebox.showerror("Error", "Valid LBIX file must be selected.")
-            return
-        try:
-            main_img, script_text = load_lbix(path)
-            self.script_runner = LBScriptRunner(self.master, main_img, os.path.basename(path))
+        if os.path.exists(path):
+            img, script = load_lbix(path)
+            self.script_runner = LBScriptRunner(self.master, img, os.path.basename(path))
             self.script_runner.show_image()
-            self.script_runner.run_script(script_text)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to run script: {e}")
+            self.script_runner.run_script(script)
 
-def main():
+if __name__ == "__main__":
     root = tk.Tk()
     app = LBIXApp(root)
     root.mainloop()
-
-if __name__ == "__main__":
-    main()
