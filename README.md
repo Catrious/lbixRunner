@@ -9,10 +9,9 @@ showmsgbox "Window Title", "Message content" --shows a message box <br>
 showtxtbox "Window Title", "Message content" --same as showmsgbox but with a text box <br>
 %txtboxinput% --stored input from showtxtbox <br>
 setwintitle "Title" --sets the window title <br>
-transparency 10 --sets the window transparency (kind of like modern Aero) <br>
-wait 2 --waits seconds before running the next command <br>
+transparency sub 10 --subtracts 10 from the window transparency (kind of like modern Aero) <br>
+wait 5000 --waits miliseconds before running the next command <br>
 %lbixname% --the .lbix name <br>
-math 2+2 --a mini calculator <br>
 showfilepicker "Window Title" --shows a file picker <br>
 %filepicked% --the file picked path <br>
 close --closes the image window <br>
